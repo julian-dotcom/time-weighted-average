@@ -85,7 +85,6 @@ class TimeWeightedReturns:
         dt.timedelta(hours=8 * n)
         while True:
             end = self.determine_end_sort_key(start_obj, n)
-            print(self.start, end)
             balances = self.fetch_balances_for_window(end)
             n += 1
 
