@@ -1,11 +1,10 @@
 # =============================================================================
 # IMPORTS
 # =============================================================================
-import sys, os, boto3, pandas as pd, pytz
+import os, boto3
 from dotenv import load_dotenv
 from pprint import pprint
 import datetime as dt
-import matplotlib.pyplot as plt
 
 load_dotenv()
 
@@ -39,17 +38,17 @@ class TimeWeightedReturns:
     EPOCH_N = 5  # len of epoch string in sort key (e.g.: 00002#2023-01-10 00:00:00)
     TIME_DELTA = 8  # the amount of hours we fetch for
 
-    def __init__(self, name, end):
+    def __init__(self, name):
         self.name = name
-        self.end_date = end
+        self.now_str = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
     # =============================================================================
     # MAIN
     # =============================================================================
     def main(self):
         self.get_most_recent_update_n_build_start_str()
-        self.get_cur_epoch_n_build_end_str()
-        self.fetch_balances_for_window()
+        self.get_all_epochs()
+        self.determine_window_n_fetch_balances()
         self.determine_period_cutoffs()
         self.determine_period_percentage_pnls()
         self.save_pnls_to_db()
@@ -67,26 +66,56 @@ class TimeWeightedReturns:
     # =============================================================================
     # QUERY FOR MOST RECENT UPDATE IN TWR TABLE, BUILD START_STR FOR BALANCES TABLE
     # =============================================================================
-    def get_cur_epoch_n_build_end_str(self):
+    def get_all_epochs(self):
         KCE = "#pk = :pk"
         EAN = {"#pk": "event"}
         EAV = {":pk": "epoch"}
         res = self.query_dynamodb(EVENTS, KCE, EAN, EAV)
-        epochs = [
-            str(r["info"]["epoch"]) for r in res if r["timestamp"] < self.end_date
+        self.epochs = [
+            {"epoch": str(r["info"]["epoch"]), "timestamp": r["timestamp"]} for r in res
         ]
-        epoch = f"{(self.EPOCH_N - len(str(max(epochs))))* '0'}{max(epochs)}"
-        self.end = f"{epoch}#{self.end_date}"
+
+    # =============================================================================
+    # NORMALLY, WINDOW = 8hrs, BUT SOMETIMES NO UPDATE EXISTS IN WINDOW. THEN WE NEED
+    # TO INCREASE WINDOW SIZE INCREMENTALLY
+    # =============================================================================
+    def determine_window_n_fetch_balances(self):
+        n = 1
+        start_obj = self.dt_str_to_obj(self.start.split("#")[-1])
+        dt.timedelta(hours=8 * n)
+        while True:
+            end = self.determine_end_sort_key(start_obj, n)
+            print(self.start, end)
+            balances = self.fetch_balances_for_window(end)
+            n += 1
+
+            if len(balances) > 1:  # Need at least 2 to compute pnl
+                break
+            if end.split("#")[-1] > self.now_str:  # don't iterate into future
+                break
+            if len(balances) == 0:
+                raise Exception("Should always return at least one balance")
+        self.balances = balances
+
+    # =============================================================================
+    # DETERMINE THE UPPER BOUND SORT KEY FOR QUERYING FOR BALANCES
+    # =============================================================================
+    def determine_end_sort_key(self, start_obj, n):
+        end_obj = start_obj + dt.timedelta(hours=self.TIME_DELTA * n)
+        end_str = self.dt_obj_to_str(end_obj)
+        epoch = max([e["epoch"] for e in self.epochs if e["timestamp"] < end_str])
+        return f"{'0' * (self.EPOCH_N - len(epoch)) + epoch}#{end_str}"
 
     # =============================================================================
     # FETCH PERIODS FOR SPECIFIC TIME PERIOD
     # =============================================================================
-    def fetch_balances_for_window(self):
+    def fetch_balances_for_window(self, end):
+        print(self.start, end, "\n")
         KCE = "#pk = :pk AND #sk BETWEEN :start AND :end"
         EAN = {"#pk": "name", "#sk": "epoch#timestamp"}
-        EAV = {":pk": self.name, ":start": self.start, ":end": self.end}
+        EAV = {":pk": self.name, ":start": self.start, ":end": end}
         bals = self.query_dynamodb(BALANCES_TABLE, KCE, EAN, EAV)
-        self.balances = self.clean_balances_from_db(bals)
+        return self.clean_balances_from_db(bals)
 
     # =============================================================================
     # CLEAN RESPONSE FROM DYNAMODB TO ONLY INCLUDE RELEVANT STUFF
@@ -175,39 +204,20 @@ class TimeWeightedReturns:
         res = table.query(**query_kwargs)
         return res.get("Items", [])
 
+    # =============================================================================
+    # CONVERT DATETIME OBJECT TO STR
+    # =============================================================================
+    def dt_obj_to_str(self, dt_obj):
+        return dt_obj.strftime("%Y-%m-%d %H:%M:%S")
+
+    # =============================================================================
+    # CONVERT DATETIME STR TO OBJ
+    # =============================================================================
+    def dt_str_to_obj(self, dt_str):
+        return dt.datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+
 
 if __name__ == "__main__":
-    start = dt.datetime(2022, 12, 26, 0, 0, 0)
-    end = dt.datetime(2023, 1, 10, 0, 0, 0)
-    delta = dt.timedelta(hours=8)
-    cur = start
+    obj = TimeWeightedReturns("bevy_fund")
     pnls = []
-    while cur < end:
-        print(cur)
-        time = cur.strftime("%Y-%m-%d %H:%M:%S")
-        obj = TimeWeightedReturns("bevy_fund", time)
-        pnls.extend(obj.main())
-        cur += delta
-        print()
-
-    pnls = pd.DataFrame(pnls)
-    pnls["timestamp"] = pd.to_datetime(pnls["timestamp"])
-    pnls["pnl"] = pd.to_numeric(pnls["pnl"])
-    pnls["cumulative"] = pnls["pnl"].cumsum()
-    print(pnls)
-    pnls.plot(x="timestamp", y="cumulative", kind="line")
-
-    plt.xlabel("Timestamp")
-    plt.ylabel("PNL")
-    plt.title("PNL over Time")
-
-    plt.show()
-
-
-# THIS IF FOR STANDARD OPERATION WITH CRONTAB
-# now = dt.datetime.now(dt.timezone.utc)
-# end = now.replace(hour=0, minute=0, second=0, microsecond=0)
-# end += dt.timedelta(hours=(8 * (now.hour // 8)))
-# end = str(end).split("#")[-1]
-# obj = TimeWeightedReturns("bevy_fund", end="2023-02-02")
-# pnls = obj.main()
+    obj.main()
