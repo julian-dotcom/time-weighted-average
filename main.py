@@ -37,64 +37,46 @@ TMR_TABLE = dynamodb.Table("TimeWeightedReturns")
 # =============================================================================
 class TimeWeightedReturns:
     EPOCH_N = 5  # len of epoch string in sort key (e.g.: 00002#2023-01-10 00:00:00)
+    TIME_DELTA = 8  # the amount of hours we fetch for
 
-    def __init__(self, name, start, end):
+    def __init__(self, name, end):
         self.name = name
-        self.end = end
+        self.end_date = end
 
     # =============================================================================
     # MAIN
     # =============================================================================
     def main(self):
-        self.determine_relevant_epochs()
+        self.get_most_recent_update_n_build_start_str()
+        self.get_cur_epoch_n_build_end_str()
         self.fetch_balances_for_window()
-        self.fetch_one_balance_before_window()
         self.determine_period_cutoffs()
         self.determine_period_percentage_pnls()
         self.save_pnls_to_db()
         return self.pnls
 
     # =============================================================================
-    # DETERMINE RELEVANT EPOCH, TO PULL BALANCES LATER
-    # can be multiple epochs, if epoch start is between self.start & self.end
+    # QUERY FOR MOST RECENT UPDATE IN TWR TABLE, BUILD START_STR FOR BALANCES TABLE
     # =============================================================================
-    def determine_relevant_epochs(self):
+    def get_most_recent_update_n_build_start_str(self):
+        kce, ean, eav = "#n = :v", {"#n": "name"}, {":v": "bevy_fund"}
+        limit, sfi = 1, False
+        res = self.query_dynamodb(TMR_TABLE, kce, ean, eav, limit, sfi)[0]
+        self.start = f"{res['epoch']}#{res['timestamp']}"
+
+    # =============================================================================
+    # QUERY FOR MOST RECENT UPDATE IN TWR TABLE, BUILD START_STR FOR BALANCES TABLE
+    # =============================================================================
+    def get_cur_epoch_n_build_end_str(self):
         KCE = "#pk = :pk"
         EAN = {"#pk": "event"}
         EAV = {":pk": "epoch"}
-        epochs = self.query_dynamodb(EVENTS, KCE, EAN, EAV)
-        start_epochs = []
-        end_epochs = []
-
-        for epoch in epochs:
-            ep = str(epoch["info"]["epoch"])
-            # Find largest epoch that started before self.start
-            if epoch["timestamp"] < self.start:
-                start_epochs.append(ep)
-            # Find if if any epoch deadlines between self.start && self.end
-            if epoch["timestamp"] > self.start and epoch["timestamp"] < self.end:
-                end_epochs.append(ep)
-        start_epoch = max(start_epochs) if len(start_epochs) else "0"
-
-        if len(end_epochs) > 0:
-            end_epoch = max(end_epochs)
-        end_epoch = max(end_epochs) if len(end_epochs) > 0 else None
-
-        self.prepare_balances_sort_key(start_epoch, end_epoch)
-
-    # =============================================================================
-    # PREPARE SORT KEYS TO QUERY BALANCES
-    # =============================================================================
-    def prepare_balances_sort_key(self, start_epoch, end_epoch):
-        start = "0" * (self.EPOCH_N - len(start_epoch)) + start_epoch
-        self.sort_start = f"{start}#{self.start}"
-
-        if end_epoch is not None:
-            end = "0" * (self.EPOCH_N - len(end_epoch)) + end_epoch
-            self.sort_end = f"{end}#{self.end}"
-        else:
-            end = start
-            self.sort_end = f"{end}#{self.end}"
+        res = self.query_dynamodb(EVENTS, KCE, EAN, EAV)
+        epochs = [
+            str(r["info"]["epoch"]) for r in res if r["timestamp"] < self.end_date
+        ]
+        epoch = f"{(self.EPOCH_N - len(str(max(epochs))))* '0'}{max(epochs)}"
+        self.end = f"{epoch}#{self.end_date}"
 
     # =============================================================================
     # FETCH PERIODS FOR SPECIFIC TIME PERIOD
@@ -102,27 +84,9 @@ class TimeWeightedReturns:
     def fetch_balances_for_window(self):
         KCE = "#pk = :pk AND #sk BETWEEN :start AND :end"
         EAN = {"#pk": "name", "#sk": "epoch#timestamp"}
-        EAV = {":pk": self.name, ":start": self.sort_start, ":end": self.sort_end}
+        EAV = {":pk": self.name, ":start": self.start, ":end": self.end}
         bals = self.query_dynamodb(BALANCES_TABLE, KCE, EAN, EAV)
         self.balances = self.clean_balances_from_db(bals)
-
-    # =============================================================================
-    # NEED TO KNOW ONE RECORD BEFORE TIME WINDOW AS BASE VALUE
-    # =============================================================================
-    def fetch_one_balance_before_window(self):
-        if len(self.balances) == 0:
-            return
-        if self.balances[0]["update_type"] == "initiation":
-            return
-        first_timestamp = min([b["epoch#timestamp"] for b in self.balances])
-        KCE = "#pk = :pk AND #sk < :sk"
-        EAN = {"#pk": "name", "#sk": "epoch#timestamp"}
-        EAV = {":pk": self.name, ":sk": first_timestamp}
-
-        prev = self.query_dynamodb(BALANCES_TABLE, KCE, EAN, EAV, limit=1, sif=False)
-
-        bal = self.clean_balances_from_db(prev)
-        self.balances = bal + self.balances
 
     # =============================================================================
     # CLEAN RESPONSE FROM DYNAMODB TO ONLY INCLUDE RELEVANT STUFF
@@ -213,35 +177,37 @@ class TimeWeightedReturns:
 
 
 if __name__ == "__main__":
-    now = dt.datetime.now(dt.timezone.utc)
-    end = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end += dt.timedelta(hours=(8 * (now.hour // 8)))
-    obj = TimeWeightedReturns("bevy_fund", end=end)
-    pnls = obj.main()
+    start = dt.datetime(2022, 12, 26, 0, 0, 0)
+    end = dt.datetime(2023, 1, 10, 0, 0, 0)
+    delta = dt.timedelta(hours=8)
+    cur = start
+    pnls = []
+    while cur < end:
+        print(cur)
+        time = cur.strftime("%Y-%m-%d %H:%M:%S")
+        obj = TimeWeightedReturns("bevy_fund", time)
+        pnls.extend(obj.main())
+        cur += delta
+        print()
+
+    pnls = pd.DataFrame(pnls)
+    pnls["timestamp"] = pd.to_datetime(pnls["timestamp"])
+    pnls["pnl"] = pd.to_numeric(pnls["pnl"])
+    pnls["cumulative"] = pnls["pnl"].cumsum()
+    print(pnls)
+    pnls.plot(x="timestamp", y="cumulative", kind="line")
+
+    plt.xlabel("Timestamp")
+    plt.ylabel("PNL")
+    plt.title("PNL over Time")
+
+    plt.show()
 
 
-# delta = dt.timedelta(hours=8)
-# cur = start
-# pnls = []
-# while cur < end:
-#     print(cur)
-#     start_w = cur.strftime("%Y-%m-%d %H:%M:%S")
-#     end_w = (cur + delta).strftime("%Y-%m-%d %H:%M:%S")
-#     obj = TimeWeightedReturns("bevy_fund", start_w, end_w)
-#     pnls.extend(obj.main())
-#     cur += delta
-#     print()
-
-# pnls = pd.DataFrame(pnls)
-# pnls["timestamp"] = pd.to_datetime(pnls["timestamp"])
-# pnls["pnl"] = pd.to_numeric(pnls["pnl"])
-# pnls["cumulative"] = pnls["pnl"].cumsum()
-# print(pnls)
-
-# pnls.plot(x="timestamp", y="cumulative", kind="line")
-
-# plt.xlabel("Timestamp")
-# plt.ylabel("PNL")
-# plt.title("PNL over Time")
-
-# plt.show()
+# THIS IF FOR STANDARD OPERATION WITH CRONTAB
+# now = dt.datetime.now(dt.timezone.utc)
+# end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+# end += dt.timedelta(hours=(8 * (now.hour // 8)))
+# end = str(end).split("#")[-1]
+# obj = TimeWeightedReturns("bevy_fund", end="2023-02-02")
+# pnls = obj.main()
